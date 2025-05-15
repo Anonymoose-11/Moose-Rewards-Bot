@@ -1,3 +1,7 @@
+# database and log files
+*.db
+*.log
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
