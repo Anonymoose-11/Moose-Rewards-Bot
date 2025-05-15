@@ -1,109 +1,84 @@
-import decimal
 from datetime import datetime, timezone, timedelta
-
+from discord.ext import tasks
 import discord
 from discord import app_commands
-import pymongo
+import sqlite3
 from discord.ext import commands
 import logging
 import os
 from dotenv import load_dotenv
 from discord.ui import View, Button
-from math import ceil
 
-class TransactionView(View):
-    def __init__(self, transactions, user_id, page_size=5):
-        super().__init__(timeout=60)
-        self.change = None
-        self.balance = None
-        self.transactions = transactions
-        self.user_id = user_id
-        self.page_size = page_size
-        self.current_page = 0
-        self.total_pages = ceil(len(transactions) / page_size)
+def init_db():
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            discord_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL
+        )
+    """)
 
-        self.prev_button = Button(label="⏮ Previous", style=discord.ButtonStyle.secondary)
-        self.next_button = Button(label="Next ⏭", style=discord.ButtonStyle.secondary)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS point_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT NOT NULL,
+            points INTEGER NOT NULL,
+            earned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL
+        )
+    """)
 
-        self.prev_button.callback = self.prev_page
-        self.next_button.callback = self.next_page
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS store_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            cost INTEGER NOT NULL,
+            description TEXT NOT NULL
+        )
+    """)
 
-        self.add_item(self.prev_button)
-        self.add_item(self.next_button)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT NOT NULL,
+            item_id INTEGER NOT NULL,
+            purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (item_id) REFERENCES store_items (id)
+        )
+    """)
 
-    async def send_page(self, interaction):
-        start = self.current_page * self.page_size
-        end = start + self.page_size
-        entries = self.transactions[start:end]
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
 
-        guild = interaction.guild
-        lines = []
+    conn.commit()
+    conn.close()
 
-        def get_display_name(user_id):
-            member = guild.get_member(user_id)
-            if member:
-                return f"<@{user_id}>"
-            else:
-                account = accounts.find_one({"uuid": user_id})
-                return account["username"] if account else f"User({user_id})"
+init_db()
 
-        # Transaction lines
-        for tx in entries:
-            amount = decimal.Decimal(tx["amount"])
-            time = tx["timestamp"].astimezone().strftime("%Y-%m-%d %H:%M")
+@tasks.loop(hours=24)
+async def cleanup_expired_points():
+    deleted = remove_expired_points()
+    print(f"[Point Cleanup] Removed {deleted} expired point entries.")
 
-            sender_id = tx["sender_uuid"]
-            recipient_id = tx["recipient_uuid"]
+def remove_expired_points():
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
 
-            if sender_id == 0:
-                lines.append(f"🏦 **Deposit**: +£{amount:.2f} at `{time}`")
-            elif recipient_id == 0:
-                lines.append(f"🏦 **Withdrawal**: -£{amount:.2f} at `{time}`")
-            elif sender_id == self.user_id:
-                recipient_name = get_display_name(recipient_id)
-                lines.append(f"❌ Sent **£{amount:.2f}** to {recipient_name} at `{time}`")
-            else:
-                sender_name = get_display_name(sender_id)
-                lines.append(f"✅ Received **£{amount:.2f}** from {sender_name} at `{time}`")
+    cur.execute("""
+        DELETE FROM point_entries
+        WHERE expires_at <= ?
+    """, (datetime.now(),))
 
-        # Top line: balance and change
-        summary = f"💼 **Balance:** £{self.balance:.2f} {self.change}\n"
-        summary += "\n".join(lines) if lines else "No transactions."
+    deleted = cur.rowcount  # Number of rows deleted (for logging)
+    conn.commit()
+    conn.close()
 
-        for i in range(5 - len(lines)):
-            summary += "\n"
-
-        summary += f"\n\nPage {self.current_page + 1}/{self.total_pages}"
-
-        await interaction.response.edit_message(content=summary, view=self)
-
-    async def prev_page(self, interaction: discord.Interaction):
-        if self.current_page > 0:
-            self.current_page -= 1
-            await self.send_page(interaction)
-        await self.send_page(interaction)
-
-    async def next_page(self, interaction: discord.Interaction):
-        if self.current_page < self.total_pages - 1:
-            self.current_page += 1
-            await self.send_page(interaction)
-        await self.send_page(interaction)
-
-    async def format_page(self, menu, entries):
-        lines = []
-        for tx in entries:
-            is_sender = tx["sender_uuid"] == self.user_id
-            other_id = tx["recipient_uuid"] if is_sender else tx["sender_uuid"]
-            other_user = await menu.ctx.guild.fetch_member(other_id)
-            other_name = other_user.display_name if other_user else "Unknown"
-            amount = decimal.Decimal(tx["amount"])
-            time = tx["timestamp"].astimezone().strftime("%Y-%m-%d %H:%M")
-
-            symbol = "❌ Sent" if is_sender else "✅ Received"
-            sign = "-" if is_sender else "+"
-            lines.append(f"{symbol} **£{amount:.2f}** to/from **{other_name}** at `{time}`")
-
-        return "\n".join(lines)
+    return deleted
 
 class Client(commands.Bot):
     async def on_ready(self):
@@ -118,6 +93,10 @@ class Client(commands.Bot):
         except Exception as e:
             print(f"Failed to sync guild: {e}")
 
+        # Start cleanup task
+        if not cleanup_expired_points.is_running():
+            cleanup_expired_points.start()
+
 load_dotenv()
 
 GUILD_ID = discord.Object(id=int(os.getenv("GUILD_ID")))
@@ -125,12 +104,6 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 
 token = os.getenv('DISCORD_TOKEN')
 
-mongoClient = pymongo.MongoClient(
-      "mongodb+srv://Anonymoose:e3mZCvtQt5UlD2Zx@idb-database.ssxj1mg.mongodb.net/?retryWrites=true&w=majority&appName=IDB-Database")
-db = mongoClient["bankDB"]
-accounts = db["accounts"]
-transactions = db["transactions"]
-loans = db["loans"]
 
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
 intents = discord.Intents.default()
@@ -139,201 +112,255 @@ intents.members = True
 
 client = Client(command_prefix='/', intents=intents)
 
-@client.tree.command(name="statement", description="Shows your financial statement", guild=GUILD_ID)
-async def statement(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    user_account = accounts.find_one({"uuid": user_id})
-    user_loans = list(loans.find({"uuid": user_id}))
-
-    if not user_account:
-        await interaction.response.send_message("You're not registered in the bank yet!", ephemeral=True)
+@client.event
+async def on_raw_reaction_add(payload):
+    if payload.member is None or payload.member.bot:
         return
 
-    username = user_account["username"]
-    cash_balance = decimal.Decimal(user_account["balance"])
-    investment_value = decimal.Decimal(user_account["investments"] if user_account["investments"] is not None else 0)
-
-    # Format loan descriptions
-    loan_lines = []
-    for loan in user_loans:
-        amount = decimal.Decimal(loan.get("amount", 0))
-        rate = loan.get("interest_rate", 0)
-        interval = loan.get("interval", "unknown interval")
-        loan_lines.append(f"Loan of £{amount:.2f} with {rate}% every {interval}")
-
-    loan_summary = "\n".join(loan_lines) if loan_lines else "None"
-
-    summary = (
-        f"**User Name:** {username}\n"
-        f"💷 **Cash Balance:** £{cash_balance:.2f}\n"
-        f"📈 **Investment Value:** £{investment_value:.2f}\n\n"
-        f"📑 **Pending Payments:**\n{loan_summary}"
-    )
-
-    await interaction.response.send_message(summary, ephemeral=True)
-
-@client.tree.command(name="pay", description="Pay another user by Discord", guild = GUILD_ID)
-@app_commands.describe(recipient="Discord Member", amount="Amount to pay")
-async def pay(interaction: discord.Interaction, recipient: discord.Member, amount: str):
-    amount = decimal.Decimal(amount)
-    sender_id = interaction.user.id
-
-    # Find the sender
-    if amount < decimal.Decimal("0.01"):
-        await interaction.response.send_message("Please enter an amount greater than zero.", ephemeral=True)
-        return None
-
-    sender = accounts.find_one({"uuid": sender_id})
-
-    if not sender:
-        await interaction.response.send_message("You're not registered in the bank yet!", ephemeral=True)
-        return None
-
-    if sender["balance"] < amount:
-        await interaction.response.send_message("You don't have enough balance.", ephemeral=True)
-        return None
-
-    # Try finding recipient by ID or username
-    user_to = accounts.find_one({"uuid": recipient.id})
-
-    if not user_to:
-        await interaction.response.send_message("This user does not have an account.", ephemeral=True)
+    emoji = str(payload.emoji)
+    if emoji != "🎫":
         return
 
-    # Update balances
-    accounts.update_one({"uuid": sender_id}, {"$inc": {"balance": float(-amount)}})
-    accounts.update_one({"uuid": user_to["uuid"]}, {"$inc": {"balance": float(amount)}})
+    ticket_message_id = get_setting("ticket_prompt_message_id")
 
-    transactions.insert_one({
-        "sender_uuid": sender_id,
-        "recipient_uuid": user_to["uuid"],
-        "amount": float(amount),
-        "timestamp": datetime.now(timezone.utc)
-    })
-
-    await interaction.response.send_message(
-        f"{interaction.user.display_name} paid {user_to['username']} **£{amount}**!"
-    )
-
-@client.tree.command(name="transactions", description="View your balance changes and recent transactions", guild=GUILD_ID)
-@app_commands.describe(range="Time range to calculate change")
-@app_commands.choices(range=[
-    app_commands.Choice(name="Day", value="day"),
-    app_commands.Choice(name="Week", value="week"),
-    app_commands.Choice(name="Month", value="month"),
-    app_commands.Choice(name="Year", value="year")
-])
-async def list_transactions(interaction: discord.Interaction, range: app_commands.Choice[str]):
-    await interaction.response.defer(ephemeral=True)
-
-    user_id = interaction.user.id
-    now = datetime.now(timezone.utc)
-
-    if range.value == "day":
-        start_date = now - timedelta(days=1)
-    elif range.value == "week":
-        start_date = now - timedelta(weeks=1)
-    elif range.value == "month":
-        start_date = now - timedelta(days=30)
-    elif range.value == "year":
-        start_date = now - timedelta(days=365)
-
-    user_account = accounts.find_one({"uuid": user_id})
-    if not user_account:
-        await interaction.followup.send("You're not registered in the bank yet!", ephemeral=True)
+    if payload.message_id != ticket_message_id:
         return
 
-    balance = user_account["balance"]
+    guild = client.get_guild(payload.guild_id)
+    member = payload.member
 
-    txs = list(transactions.find({
-        "$or": [
-            {"sender_uuid": user_id},
-            {"recipient_uuid": user_id}
-        ],
-        "timestamp": {"$gte": start_date}
-    }).sort("timestamp", -1))
-
-    total_in = sum(tx["amount"] for tx in txs if tx["recipient_uuid"] == user_id)
-    total_out = sum(tx["amount"] for tx in txs if tx["sender_uuid"] == user_id)
-    net = decimal.Decimal(total_in) - decimal.Decimal(total_out)
-    net_str = "("
-    net_str += f"+£{net:.2f}" if net >= 0 else f"-£{abs(net):.2f}"
-    net_str += f" in the last {range.name.lower()})"
-
-    header = f"💼 **Balance:** £{balance:.2f} {net_str}\n\n"
-
-    if not txs:
-        await interaction.followup.send(header + "No transactions found.", ephemeral=True)
+    # Check if the user already has an open ticket
+    existing = discord.utils.get(guild.text_channels, name=f"ticket-{member.name.lower()}")
+    if existing:
         return
 
-    view = TransactionView(txs, user_id)
-    view.balance = balance
-    view.change = net_str
-    await interaction.followup.send(header, view=view, ephemeral=True)
-    await view.send_page(await interaction.original_response())
-
-@client.tree.command(name="balance", description="Shows your balance", guild = GUILD_ID)
-async def balance(interaction: discord.Interaction):
-    sender_id = interaction.user.id
-
-    sender = accounts.find_one({"uuid": sender_id})
-
-    if not sender:
-        await interaction.response.send_message("You're not registered in the bank yet!", ephemeral=True)
-        return
-
-    await interaction.response.send_message(f"Current balance: **£{sender['balance']}**", ephemeral=True)
-
-@client.tree.command(name="withdraw", description="Open a ticket to withdraw money", guild = GUILD_ID)
-@app_commands.describe(amount="Amount to withdraw")
-async def withdraw(interaction: discord.Interaction, amount: str):
-    await createTicket(interaction, f"withdrawal of **£{amount}**")
-
-@client.tree.command(name="deposit", description="Open a ticket to deposit money", guild = GUILD_ID)
-@app_commands.describe(amount="Amount to deposit")
-async def deposit(interaction: discord.Interaction, amount: str):
-    await createTicket(interaction, f"deposit of **£{amount}**")
-
-async def createTicket(interaction: discord.Interaction, reason: str):
-    guild = interaction.guild
-    author = interaction.user
-
-    tickets_category_id = int(os.getenv("TICKET_CATEGORY_ID"))
-    category = discord.utils.get(guild.categories, id=tickets_category_id)
-
+    category_id = int(os.getenv("TICKET_CATEGORY_ID"))
+    category = discord.utils.get(guild.categories, id=category_id)
     admin_role = discord.utils.get(guild.roles, name="Admin")
 
-    # Check if a ticket already exists
-    existing_channel = discord.utils.get(guild.text_channels, name=f"ticket-{author.name.lower()}")
-    if existing_channel:
-        await interaction.response.send_message("You already have an open ticket.", ephemeral=True)
-        return
-
-    # Define permissions
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        author: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         admin_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
     }
 
-    # Create the channel
     channel = await guild.create_text_channel(
-        name=f"ticket-{author.name}",
+        name=f"ticket-{member.name}",
         category=category,
         overwrites=overwrites,
         reason="Support ticket"
     )
 
-    await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
-    await channel.send(f"{author.mention} your ticket has been created for a(n) {reason}. A teller will be with you shortly.")
+    await channel.send(f"{member.mention} your ticket has been created. A staff member will be with you shortly.")
 
-@client.tree.command(name="pgc", description="Apply for a Principal-Guaranteed-Certificate", guild = GUILD_ID)
-async def pgc(interaction: discord.Interaction):
-    await createTicket(interaction, f"application for a Principal-Guaranteed-Certificate")
+def set_setting(key: str, value: str):
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, (key, value))
+    conn.commit()
+    conn.close()
 
-@client.tree.command(name="register", description="Register your account", guild = GUILD_ID)
-async def register(interaction: discord.Interaction):
-    await createTicket(interaction, f"account registration of **{interaction.user.display_name}**")
+def get_setting(key: str) -> str | None:
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def total_points(discord_id: str) -> int:
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT SUM(points)
+        FROM point_entries
+        WHERE discord_id = ?
+        AND expires_at > CURRENT_TIMESTAMP
+        """, (discord_id,))
+    result = cur.fetchone()
+
+    return result[0] if result else 0
+
+def spend_points(discord_id: str, amount: int) -> bool:
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    # Fetch unexpired point entries in FIFO order
+    cur.execute("""
+        SELECT id, points FROM point_entries
+        WHERE discord_id = ? AND expires_at > ?
+        ORDER BY earned_at ASC
+    """, (discord_id, datetime.now()))
+
+    rows = cur.fetchall()
+    remaining = amount
+
+    for row in rows:
+        entry_id, available = row
+
+        if available > remaining:
+            cur.execute("UPDATE point_entries SET points = points - ? WHERE id = ?", (remaining, entry_id))
+        else:
+            cur.execute("DELETE FROM point_entries WHERE id = ?", (entry_id,))
+            remaining -= available
+        if remaining == 0:
+            break
+
+    conn.commit()
+    conn.close()
+
+    return remaining == 0  # True if fully spent
+
+@client.tree.command(name="points", description="Shows your balance", guild=GUILD_ID)
+async def points(interaction: discord.Interaction):
+    remove_expired_points()
+    user_id = str(interaction.user.id)
+
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM users WHERE discord_id = ?", (user_id,))
+
+    if not cur.fetchone():
+        await interaction.response.send_message("You're not registered yet!", ephemeral=True)
+        return
+
+    conn.close()
+
+    points = total_points(user_id)
+    await interaction.response.send_message(f"Current points: **{points}**", ephemeral=True)
+
+@client.tree.command(name="store", description="Opens the point store", guild = GUILD_ID)
+async def store(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    # Get total available points]
+    user_points = total_points(user_id)
+
+    if user_points == 0:
+        await interaction.response.send_message("You have no points!", ephemeral=True)
+        conn.close()
+        return
+
+    # Fetch store items
+    cur.execute("SELECT id, name, cost, description FROM store_items")
+    items = cur.fetchall()
+
+    if not items:
+        await interaction.response.send_message("The store is currently empty.", ephemeral=True)
+        conn.close()
+        return
+
+    embed = discord.Embed(title="🛒 Point Store", description=f"You have **{user_points}** points",
+                          color=discord.Color.green())
+    view = View()
+
+    for item_id, name, cost, description in items:
+        embed.add_field(name=f"{name} - {cost} pts", value=description, inline=False)
+
+        async def buy_callback(interact: discord.Interaction, item_id=item_id, name=name, cost=cost):
+            conn = sqlite3.connect("points.db")
+            cur = conn.cursor()
+
+            # Recalculate user's valid points
+            total = total_points(user_id)
+            if total < cost:
+                await interact.response.send_message("You don't have enough points!", ephemeral=True)
+                conn.close()
+                return
+
+            spend_points(user_id, total)
+
+            cur.execute("""
+                INSERT INTO user_inventory (discord_id, item_id)
+                VALUES (?, ?)
+                """, (user_id, item_id))
+
+            conn.commit()
+            conn.close()
+            await interact.response.send_message(f"You bought **{name}** for {cost} points!", ephemeral=True)
+
+        button = Button(label=f"Buy {name}", style=discord.ButtonStyle.primary)
+        button.callback = buy_callback
+        view.add_item(button)
+
+    conn.close()
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+@client.tree.command(name="register", description="Register for the rewards program", guild = GUILD_ID)
+@app_commands.describe(username="Minecraft username")
+async def register(interaction: discord.Interaction, username: str):
+    discord_id = str(interaction.user.id)
+
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    # Check if already registered
+    cur.execute("SELECT * FROM users WHERE discord_id = ?", (discord_id,))
+    if cur.fetchone():
+        await interaction.response.send_message("You're already registered!", ephemeral=True)
+    else:
+        cur.execute("INSERT INTO users (discord_id, username) VALUES (?, ?)", (discord_id, username))
+        conn.commit()
+        await interaction.response.send_message(f"Registered {username} successfully!", ephemeral=True)
+
+    conn.close()
+
+@client.tree.command(name="referral", description="Register for the rewards program", guild = GUILD_ID)
+@app_commands.describe(username="Minecraft username")
+async def referral(interaction: discord.Interaction, username: str, member: discord.Member):
+    discord_id = str(interaction.user.id)
+    referral_id = str(member.id)
+
+    if discord_id == referral_id:
+        await interaction.response.send_message("You cannot refer yourself!", ephemeral=True)
+        return
+
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    # Check if user is already registered
+    cur.execute("SELECT * FROM users WHERE discord_id = ?", (discord_id,))
+    if cur.fetchone():
+        await interaction.response.send_message("You're already registered!", ephemeral=True)
+        conn.close()
+        return
+
+    # Check if referral exists
+    cur.execute("SELECT * FROM users WHERE discord_id = ?", (referral_id,))
+    if not cur.fetchone():
+        await interaction.response.send_message("The referred member is not registered!", ephemeral=True)
+        conn.close()
+        return
+
+    # Register new user
+    cur.execute("INSERT INTO users (discord_id, username) VALUES (?, ?)", (discord_id, username))
+    conn.commit()
+
+    # Reward referrer
+    now = datetime.now()
+    expiry = now + timedelta(days=180)
+    cur.execute("""
+                INSERT INTO point_entries (discord_id, points, earned_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                """, (referral_id, 100, now, expiry))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"Registered successfully! {member.display_name} has earned 100 points for referring you.", ephemeral=True)
+
+    log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(f"✅ **{member}** got **100** points from referring **{interaction.user}**.**")
 
 @client.tree.command(name="close", description="Closes your ticket", guild=GUILD_ID)
 async def close_ticket(interaction: discord.Interaction, reason: str):
@@ -368,66 +395,192 @@ async def close_ticket(interaction: discord.Interaction, reason: str):
 # Admin commands
 
 @app_commands.checks.has_role("Admin")
-@client.tree.command(name="register_admin", description="Register a user into the bank", guild = GUILD_ID)
-@app_commands.describe(member="Discord Member", username="Minecraft username")
-async def admin(interaction: discord.Interaction, member: discord.Member, username: str):
-    account = accounts.find_one({"uuid": member.id})
-
-    if account:
-        await interaction.response.send_message("User already registered.", ephemeral=True)
-        return
-
-    accounts.insert_one({"uuid": member.id, "username": username, "balance": 0, "investments": None})
-    await interaction.response.send_message(f"User **{username}** registered!", ephemeral=True)
-
-@app_commands.checks.has_role("Admin")
 @client.tree.command(name="remove", description="Removes balance", guild = GUILD_ID)
 @app_commands.describe(member="Discord Member", amount="Amount to take")
-async def remove_balance(interaction: discord.Interaction, member: discord.Member, amount: str):
-    amount = decimal.Decimal(amount)
-    account = accounts.find_one({"uuid": member.id})
+async def remove_balance(interaction: discord.Interaction, member: discord.Member, amount: int):
+    user_id = str(member.id)
 
-    if not account:
-        await interaction.response.send_message("User is not registered in the bank!", ephemeral=True)
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM users WHERE discord_id = ?", (user_id,))
+    if not cur.fetchone():
+        await interaction.response.send_message("User not registered!", ephemeral=True)
+        conn.close()
         return
 
-    accounts.update_one({"uuid": member.id}, {"$inc": {"balance": float(-amount)}})
-    await interaction.response.send_message(f"Removed **£{amount}** from {member.display_name}!", ephemeral=True)
+    conn.commit()
+    conn.close()
 
-    transactions.insert_one({
-        "sender_uuid": 0,
-        "recipient_uuid": member.id,
-        "amount": float(amount),
-        "timestamp": datetime.now(timezone.utc)
-    })
+    spend_points(user_id, amount)
+
+    await interaction.response.send_message(f"Removed **{amount}** points from {member.display_name}!", ephemeral=True)
 
     log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
     if log_channel:
-        await log_channel.send(f"🛑 **{interaction.user}** removed **£{amount}** from **{member}**")
+        await log_channel.send(f"🛑 **{interaction.user}** removed **£{amount}** points from **{member}**")
 
 @app_commands.checks.has_role("Admin")
 @client.tree.command(name="give", description="Gives balance", guild = GUILD_ID)
 @app_commands.describe(member="Discord Member", amount="Amount to give")
-async def remove_balance(interaction: discord.Interaction, member: discord.Member, amount: str):
-    amount = decimal.Decimal(amount)
-    account = accounts.find_one({"uuid": member.id})
+async def give_balance(interaction: discord.Interaction, member: discord.Member, amount: int):
+    user_id = str(member.id)
 
-    if not account:
-        await interaction.response.send_message("User is not registered in the bank!", ephemeral=True)
+    now = datetime.now()
+    expiry = now + timedelta(days=180)
+
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM users WHERE discord_id = ?", (user_id,))
+    if not cur.fetchone():
+        await interaction.response.send_message("User not registered!", ephemeral=True)
+        conn.close()
         return
 
-    accounts.update_one({"uuid": member.id}, {"$inc": {"balance": float(amount)}})
-    await interaction.response.send_message(f"Gave **£{amount}** to {member.display_name}!", ephemeral=True)
+    cur.execute("""
+                INSERT INTO point_entries (discord_id, points, earned_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                """, (user_id, points, now, expiry))
 
-    transactions.insert_one({
-        "sender_uuid": 0,
-        "recipient_uuid": member.id,
-        "amount": float(amount),
-        "timestamp": datetime.now(timezone.utc)
-    })
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"Gave **{amount}** points to {member.display_name}!", ephemeral=True)
 
     log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
     if log_channel:
-        await log_channel.send(f"✅ **{interaction.user}** gave **£{amount}** to **{member}**")
+        await log_channel.send(f"✅ **{interaction.user}** gave **{amount}** points to **{member}**")
 
-client.run(token, log_handler=handler, log_level=logging.DEBUG)
+@app_commands.checks.has_role("Admin")
+@client.tree.command(name="additem", description="Add or update an item in the point store", guild=GUILD_ID)
+@app_commands.describe(name="Name of the item", cost="Cost in points", description="Description of the item")
+async def additem(interaction: discord.Interaction, name: str, cost: int, description: str):
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    # Check if item already exists (by name)
+    cur.execute("SELECT id FROM store_items WHERE name = ?", (name,))
+    row = cur.fetchone()
+
+    if row:
+        cur.execute("UPDATE store_items SET cost = ?, description = ? WHERE id = ?", (cost, description, row[0]))
+        await interaction.response.send_message(f"Updated item **{name}** in the store.", ephemeral=True)
+    else:
+        cur.execute("INSERT INTO store_items (name, cost, description) VALUES (?, ?, ?)", (name, cost, description))
+        await interaction.response.send_message(f"Added item **{name}** to the store.", ephemeral=True)
+
+    conn.commit()
+    conn.close()
+
+@app_commands.checks.has_role("Admin")
+@client.tree.command(name="removeitem", description="Remove an item in the point store", guild=GUILD_ID)
+@app_commands.describe(name="Name of the item")
+async def remove_item(interaction: discord.Interaction, name: str):
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    # Check if item exists (by name)
+    cur.execute("SELECT id FROM store_items WHERE name = ?", (name,))
+    row = cur.fetchone()
+
+    if row:
+        cur.execute("DELETE FROM store_items WHERE id = ?", (row[0]))
+        await interaction.response.send_message(f"Removed item **{name}** from the store.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"No item named **{name}** found in the store.", ephemeral=True)
+
+    conn.commit()
+    conn.close()
+
+@app_commands.checks.has_role("Admin")
+@client.tree.command(name="inventory", description="View a user's purchased inventory", guild=GUILD_ID)
+@app_commands.describe(member="The member whose inventory you want to see")
+async def inventory(interaction: discord.Interaction, member: discord.Member):
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT s.name, s.description, i.purchased_at
+        FROM user_inventory i
+        JOIN store_items s ON i.item_id = s.id
+        WHERE i.discord_id = ?
+        ORDER BY i.purchased_at DESC
+    """, (str(member.id),))
+    items = cur.fetchall()
+    conn.close()
+
+    if not items:
+        await interaction.response.send_message(f"{member.display_name} has no items in their inventory.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=f"{member.display_name}'s Inventory", color=discord.Color.blue())
+    for name, desc, purchased_at in items:
+        embed.add_field(name=name, value=f"{desc}\n*Purchased at:* {purchased_at}", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@app_commands.checks.has_role("Admin")
+@client.tree.command(name="removeuseritem", description="Remove the oldest instance of an item from a user's inventory", guild=GUILD_ID)
+@app_commands.describe(member="The member whose inventory item to remove", item_name="Name of the item to remove")
+async def removeuseritem(interaction: discord.Interaction, member: discord.Member, item_name: str):
+    conn = sqlite3.connect("points.db")
+    cur = conn.cursor()
+
+    # Find the item ID from the store by name
+    cur.execute("SELECT id FROM store_items WHERE name = ?", (item_name,))
+    item = cur.fetchone()
+    if not item:
+        await interaction.response.send_message(f"Item **{item_name}** not found in store.", ephemeral=True)
+        conn.close()
+        return
+
+    item_id = item[0]
+
+    # Get the oldest (FIFO) inventory entry for this item and user
+    cur.execute("""
+        SELECT id
+        FROM user_inventory
+        WHERE discord_id = ?
+          AND item_id = ?
+        ORDER BY purchased_at ASC
+        LIMIT 1
+    """, (str(member.id), item_id))
+    inventory_entry = cur.fetchone()
+
+    if not inventory_entry:
+        await interaction.response.send_message(f"{member.display_name} does not own any **{item_name}**.", ephemeral=True)
+        conn.close()
+        return
+
+    # Delete the oldest inventory entry
+    cur.execute("DELETE FROM user_inventory WHERE id = ?", (inventory_entry[0],))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"Removed the oldest **{item_name}** from {member.display_name}'s inventory.", ephemeral=True
+    )
+
+@app_commands.checks.has_role("Admin")
+@client.tree.command(name="ticketsetup", description="Post the ticket creation message", guild=GUILD_ID)
+async def ticketsetup(interaction: discord.Interaction):
+    ticket_channel_id = int(os.getenv("TICKET_PROMPT_CHANNEL_ID"))  # Add this to your .env
+    ticket_channel = interaction.guild.get_channel(ticket_channel_id)
+
+    if not ticket_channel:
+        await interaction.response.send_message("Ticket channel not found.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Need Help or Want to Redeem Rewards?",
+        description="React with 🎫 to open a support ticket.",
+        color=discord.Color.blue()
+    )
+    message = await ticket_channel.send(embed=embed)
+    await message.add_reaction("🎫")
+
+    # Save the message ID
+    set_setting("ticket_prompt_message_id", str(message.id))
+
+    await interaction.response.send_message("Ticket message posted and reaction added.", ephemeral=True)
