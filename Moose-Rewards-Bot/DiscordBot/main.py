@@ -107,6 +107,8 @@ token = os.getenv('DISCORD_TOKEN')
 
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
 intents = discord.Intents.default()
+intents.reactions = True
+intents.guilds = True
 intents.message_content = True
 intents.members = True
 
@@ -121,13 +123,18 @@ async def on_raw_reaction_add(payload):
     if emoji != "🎫":
         return
 
-    ticket_message_id = get_setting("ticket_prompt_message_id")
+    ticket_message_id = int(get_setting("ticket_prompt_message_id"))
 
     if payload.message_id != ticket_message_id:
         return
 
     guild = client.get_guild(payload.guild_id)
     member = payload.member
+    channel = guild.get_channel(payload.channel_id)
+    message = await channel.fetch_message(payload.message_id)
+
+    # Remove the user's reaction
+    await message.remove_reaction(payload.emoji, payload.member)
 
     # Check if the user already has an open ticket
     existing = discord.utils.get(guild.text_channels, name=f"ticket-{member.name.lower()}")
@@ -277,7 +284,7 @@ async def store(interaction: discord.Interaction):
                 conn.close()
                 return
 
-            spend_points(user_id, total)
+            spend_points(user_id, cost)
 
             cur.execute("""
                 INSERT INTO user_inventory (discord_id, item_id)
@@ -418,7 +425,7 @@ async def remove_balance(interaction: discord.Interaction, member: discord.Membe
 
     log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
     if log_channel:
-        await log_channel.send(f"🛑 **{interaction.user}** removed **£{amount}** points from **{member}**")
+        await log_channel.send(f"🛑 **{interaction.user.mention}** removed **£{amount}** points from **{member.mention}**")
 
 @app_commands.checks.has_role("Admin")
 @client.tree.command(name="give", description="Gives balance", guild = GUILD_ID)
@@ -441,7 +448,7 @@ async def give_balance(interaction: discord.Interaction, member: discord.Member,
     cur.execute("""
                 INSERT INTO point_entries (discord_id, points, earned_at, expires_at)
                 VALUES (?, ?, ?, ?)
-                """, (user_id, points, now, expiry))
+                """, (user_id, amount, now, expiry))
 
     conn.commit()
     conn.close()
@@ -450,7 +457,7 @@ async def give_balance(interaction: discord.Interaction, member: discord.Member,
 
     log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
     if log_channel:
-        await log_channel.send(f"✅ **{interaction.user}** gave **{amount}** points to **{member}**")
+        await log_channel.send(f"✅ **{interaction.user.mention}** gave **{amount}** points to **{member.mention}**")
 
 @app_commands.checks.has_role("Admin")
 @client.tree.command(name="additem", description="Add or update an item in the point store", guild=GUILD_ID)
@@ -584,3 +591,5 @@ async def ticketsetup(interaction: discord.Interaction):
     set_setting("ticket_prompt_message_id", str(message.id))
 
     await interaction.response.send_message("Ticket message posted and reaction added.", ephemeral=True)
+
+client.run(token)
