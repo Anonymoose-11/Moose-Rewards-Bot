@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from discord.ext import tasks
 import discord
 from discord import app_commands
@@ -15,7 +15,8 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             discord_id TEXT PRIMARY KEY,
-            username TEXT NOT NULL
+            username TEXT NOT NULL,
+            referrals INTEGER DEFAULT 8
         )
     """)
 
@@ -342,9 +343,14 @@ async def referral(interaction: discord.Interaction, username: str, member: disc
         return
 
     # Check if referral exists
-    cur.execute("SELECT * FROM users WHERE discord_id = ?", (referral_id,))
-    if not cur.fetchone():
+    cur.execute("SELECT referrals FROM users WHERE discord_id = ?", (referral_id,))
+    row = cur.fetchone()
+    if not row:
         await interaction.response.send_message("The referred member is not registered!", ephemeral=True)
+        conn.close()
+        return
+    if row[0] == 0:
+        await interaction.response.send_message("The referred member cannot receive more referrals!", ephemeral=True)
         conn.close()
         return
 
@@ -356,9 +362,11 @@ async def referral(interaction: discord.Interaction, username: str, member: disc
     now = datetime.now()
     expiry = now + timedelta(days=180)
     cur.execute("""
-                INSERT INTO point_entries (discord_id, points, earned_at, expires_at)
-                VALUES (?, ?, ?, ?)
-                """, (referral_id, 100, now, expiry))
+        INSERT INTO point_entries (discord_id, points, earned_at, expires_at)
+        VALUES (?, ?, ?, ?)
+    """, (referral_id, 50, now, expiry))
+
+    cur.execute("UPDATE users SET referrals = referrals - 1 WHERE discord_id = ?", (referral_id,))
     conn.commit()
     conn.close()
 
