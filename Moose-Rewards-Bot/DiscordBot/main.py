@@ -327,6 +327,7 @@ async def register(interaction: discord.Interaction, username: str):
 async def referral(interaction: discord.Interaction, username: str, member: discord.Member):
     discord_id = str(interaction.user.id)
     referral_id = str(member.id)
+    amount = 50
 
     if discord_id == referral_id:
         await interaction.response.send_message("You cannot refer yourself!", ephemeral=True)
@@ -364,18 +365,18 @@ async def referral(interaction: discord.Interaction, username: str, member: disc
     cur.execute("""
         INSERT INTO point_entries (discord_id, points, earned_at, expires_at)
         VALUES (?, ?, ?, ?)
-    """, (referral_id, 50, now, expiry))
+    """, (referral_id, amount, now, expiry))
 
     cur.execute("UPDATE users SET referrals = referrals - 1 WHERE discord_id = ?", (referral_id,))
     conn.commit()
     conn.close()
 
     await interaction.response.send_message(
-        f"Registered successfully! {member.display_name} has earned 100 points for referring you.", ephemeral=True)
+        f"Registered successfully! {member.display_name} has earned {amount} points for referring you.", ephemeral=True)
 
     log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
     if log_channel:
-        await log_channel.send(f"✅ **{member}** got **100** points from referring **{interaction.user}**.**")
+        await log_channel.send(f"✅ **{member}** got **{amount}** points from referring **{interaction.user}**.")
 
 @client.tree.command(name="close", description="Closes your ticket", guild=GUILD_ID)
 async def close_ticket(interaction: discord.Interaction, reason: str):
